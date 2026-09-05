@@ -1464,30 +1464,39 @@ const manualPipe = async (readable, writable, close, speed) => {
     } catch {offset = 0, close?.()} finally {isReading = false, flushBuffer()}
 };
 const createBufferedTcpWriter = (tcpWriter, close) => {
-    const buffer = new Uint8Array(16384);
-    let offset = 0, timerId = null, closed = false;
+    const queue = new Array(256).fill(null);
+    let head = 0, tail = 0, size = 0, totalLen = 0, timerId = null, closed = false;
     const closeWriter = () => {
         if (closed) return;
-        closed = true;
-        timerId && (clearTimeout(timerId), timerId = null);
+        closed = true, timerId && (clearTimeout(timerId), timerId = null);
+        for (let i = 0; i < 256; i++) queue[i] = null;
         close?.();
     };
     const safeWrite = data => {try {tcpWriter.write(data)} catch {closeWriter()}};
     const flush = () => {
         timerId && (clearTimeout(timerId), timerId = null);
-        if (!offset || closed) return;
-        const len = offset;
-        offset = 0, safeWrite(buffer.subarray(0, len));
+        if (!size || closed) return;
+        let out;
+        if (size === 1) {
+            out = queue[head], queue[head] = null, head = (head + 1) & 255;
+        } else {
+            out = new Uint8Array(totalLen);
+            let cur = 0;
+            while (size > 0) {
+                const c = queue[head];
+                queue[head] = null, out.set(c, cur), cur += c.byteLength, head = (head + 1) & 255, size--;
+            }
+        }
+        size = totalLen = 0, safeWrite(out);
     };
     return chunk => {
         if (closed) return;
-        const data = chunk.constructor === Uint8Array ? chunk : new Uint8Array(chunk);
-        const len = data.byteLength;
+        const data = chunk.constructor === Uint8Array ? chunk : new Uint8Array(chunk), len = data.byteLength;
         if (!len) return;
-        offset + len > 16384 && flush();
         len >= 16384
-            ? safeWrite(data)
-            : (buffer.set(data, offset), offset += len, offset === 16384 ? flush() : (timerId ||= setTimeout(flush, 2)));
+            ? (flush(), safeWrite(data))
+            : (size === 256 && flush(), queue[tail] = data, tail = (tail + 1) & 255, size++, totalLen += len,
+                size === 256 || totalLen >= 32768 ? flush() : (timerId ||= setTimeout(flush, 2)));
     };
 };
 const createAsyncMicrotaskQueue = (consume, close) => {
@@ -1637,7 +1646,7 @@ const handleXwebPost = async (request) => {
             if (done) return close();
             xwebBuffer = value.buffer, used += value.byteLength;
             if (state.tcpWriter) {
-                await state.tcpWriter(value), used = 0;
+                await state.tcpWriter(value.slice()), used = 0;
             } else {
                 const payload = new Uint8Array(xwebBuffer, 0, used);
                 state.needMore = false;
